@@ -1,17 +1,20 @@
+#include <FS.h>          // File system for ESP8266
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
 #include <ESP8266mDNS.h>
 #include <ArduinoOTA.h>
+#include <WiFiManager.h>  // https://github.com/tzapu/WiFiManager
+#include <ArduinoJson.h>  // https://github.com/bblanchon/ArduinoJson
 
-// WiFi credentials
-const char* ssid = "YOUR_WIFI_SSID";
-const char* password = "YOUR_WIFI_PASSWORD";
+// WiFiManager AP settings (when no WiFi is configured)
+const char* ap_ssid = "SprinklerSetup";     // AP name for configuration portal
+const char* ap_password = "sprinklerconfig"; // AP password, empty for open network
 
 // MQTT broker details
-const char* mqtt_server = "YOUR_MQTT_BROKER_IP";
-const int mqtt_port = 1883;
-const char* mqtt_user = "YOUR_MQTT_USERNAME";
-const char* mqtt_password = "YOUR_MQTT_PASSWORD";
+char mqtt_server[40] = "";
+char mqtt_port[6] = "1883";
+char mqtt_user[24] = "";
+char mqtt_password[24] = "";
 const char* client_id = "sprinkler_controller";
 
 // MQTT topics
@@ -40,24 +43,123 @@ unsigned long lastReconnectAttempt = 0;
 unsigned long lastStatusReport = 0;
 const unsigned long STATUS_INTERVAL = 60000; // Status update every 60 seconds
 
+// Flag for WiFiManager reset
+bool shouldSaveConfig = false;
+
+// Callback notifying us of the need to save config
+void saveConfigCallback() {
+  Serial.println("Should save config");
+  shouldSaveConfig = true;
+}
+
+// Function to load saved configuration
+void loadConfig() {
+  Serial.println("Mounting file system...");
+  
+  if (SPIFFS.begin()) {
+    Serial.println("Mounted file system");
+    if (SPIFFS.exists("/config.json")) {
+      // File exists, reading and loading
+      Serial.println("Reading config file");
+      File configFile = SPIFFS.open("/config.json", "r");
+      if (configFile) {
+        Serial.println("Opened config file");
+        size_t size = configFile.size();
+        // Allocate a buffer to store contents of the file.
+        std::unique_ptr<char[]> buf(new char[size]);
+
+        configFile.readBytes(buf.get(), size);
+
+        DynamicJsonDocument json(1024);
+        DeserializationError error = deserializeJson(json, buf.get());
+        
+        if (!error) {
+          Serial.println("Parsed json");
+          strcpy(mqtt_server, json["mqtt_server"]);
+          strcpy(mqtt_port, json["mqtt_port"]);
+          strcpy(mqtt_user, json["mqtt_user"]);
+          strcpy(mqtt_password, json["mqtt_password"]);
+        } else {
+          Serial.println("Failed to load json config");
+        }
+        configFile.close();
+      }
+    }
+  } else {
+    Serial.println("Failed to mount file system");
+  }
+}
+
 void setup_wifi() {
   delay(10);
   Serial.println();
-  Serial.print("Connecting to ");
-  Serial.println(ssid);
+  // Load saved configuration first
+  loadConfig();
+  Serial.println("Setting up WiFi and MQTT params...");
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
+  // The extra parameters to be configured (can be either global or just in the setup)
+  WiFiManagerParameter custom_mqtt_server("server", "MQTT Server", mqtt_server, 40);
+  WiFiManagerParameter custom_mqtt_port("port", "MQTT Port", mqtt_port, 6);
+  WiFiManagerParameter custom_mqtt_user("user", "MQTT User", mqtt_user, 24);
+  WiFiManagerParameter custom_mqtt_password("password", "MQTT Password", mqtt_password, 24, "password");
 
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  // WiFiManager
+  // Local initialization. Once its business is done, there is no need to keep it around
+  WiFiManager wifiManager;
+
+  // Set callback for saving configuration
+  wifiManager.setSaveConfigCallback(saveConfigCallback);
+  
+  // Add all your parameters here
+  wifiManager.addParameter(&custom_mqtt_server);
+  wifiManager.addParameter(&custom_mqtt_port);
+  wifiManager.addParameter(&custom_mqtt_user);
+  wifiManager.addParameter(&custom_mqtt_password);
+  
+  // Set timeout for the configuration portal
+  wifiManager.setConfigPortalTimeout(180); // 3 minutes timeout
+  
+  // Reset saved settings - uncomment to test
+  //wifiManager.resetSettings();
+  
+  // Set custom AP name and optional password
+  bool connected = wifiManager.autoConnect(ap_ssid, ap_password);
+  
+  if (!connected) {
+    Serial.println("Failed to connect and hit timeout");
+    // Reset and try again
+    ESP.restart();
+    delay(5000);
   }
-
-  Serial.println("");
+  
+  // Read updated parameters
+  strcpy(mqtt_server, custom_mqtt_server.getValue());
+  strcpy(mqtt_port, custom_mqtt_port.getValue());
+  strcpy(mqtt_user, custom_mqtt_user.getValue());
+  strcpy(mqtt_password, custom_mqtt_password.getValue());
+  
   Serial.println("WiFi connected");
-  Serial.println("IP address: ");
+  Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
+  
+  // Save the custom parameters to file system
+  if (shouldSaveConfig) {
+    Serial.println("Saving config to /config.json");
+    DynamicJsonDocument json(1024);
+    json["mqtt_server"] = mqtt_server;
+    json["mqtt_port"] = mqtt_port;
+    json["mqtt_user"] = mqtt_user;
+    json["mqtt_password"] = mqtt_password;
+
+    File configFile = SPIFFS.open("/config.json", "w");
+    if (!configFile) {
+      Serial.println("Failed to open config file for writing");
+    } else {
+      serializeJson(json, configFile);
+      configFile.close();
+      Serial.println("Config saved successfully");
+    }
+  }
 }
 
 void setupOTA() {
@@ -145,6 +247,9 @@ void callback(char* topic, byte* payload, unsigned int length) {
 }
 
 boolean reconnect() {
+  int mqtt_port_int = atoi(mqtt_port);
+  mqtt.setServer(mqtt_server, mqtt_port_int);
+  
   if (mqtt.connect(client_id, mqtt_user, mqtt_password, topic_status, 0, true, "offline")) {
     Serial.println("MQTT connected");
     
@@ -224,7 +329,10 @@ void setup() {
   setup_wifi();
   setupOTA();
   
-  mqtt.setServer(mqtt_server, mqtt_port);
+  // MQTT server is set in reconnect() function now
+  // Convert mqtt_port string to int
+  int mqtt_port_int = atoi(mqtt_port);
+  mqtt.setServer(mqtt_server, mqtt_port_int);
   mqtt.setCallback(callback);
   
   lastReconnectAttempt = 0;

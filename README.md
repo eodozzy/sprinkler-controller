@@ -5,6 +5,8 @@ A simple yet expandable sprinkler control system built on ESP8266 that communica
 ## Features
 
 - Controls 7 sprinkler zones via relays
+- WiFiManager for easy network configuration (no hardcoded credentials)
+- Web configuration portal for WiFi and MQTT settings
 - Integrates with Home Assistant via MQTT auto-discovery
 - OTA (Over-The-Air) firmware updates
 - Automatic reconnection to WiFi and MQTT
@@ -121,6 +123,32 @@ After the initial upload via USB, you can enable OTA updates:
 - **Commands**: `home/sprinkler/zone/{1-7}/command` (payload: "ON" or "OFF")
 - **Status**: `home/sprinkler/zone/{1-7}/state` (payload: "ON" or "OFF")
 - **Controller Status**: `home/sprinkler/status` (payload: "online" or "offline")
+
+## First-Time Setup
+
+This project uses WiFiManager for easy network configuration without hardcoding credentials.
+
+1. When first powered on, the controller will create a WiFi access point named "SprinklerSetup"
+
+2. Connect to this WiFi network using password "sprinklerconfig"
+
+3. A captive portal should automatically open (or navigate to 192.168.4.1)
+
+4. Configure the following settings:
+   - Your home WiFi network credentials
+   - MQTT broker details (server, port, username, password)
+
+5. After saving, the device will connect to your WiFi network and MQTT broker
+
+6. The configuration is saved to flash memory and will be used on subsequent boots
+
+### Reset Configuration
+
+If you need to reset the WiFi or MQTT settings:
+
+1. Uncomment the line `wifiManager.resetSettings();` in the code and upload once
+2. Re-comment the line and upload again
+3. The device will reset to AP mode for reconfiguration
 
 ## Home Assistant Integration
 
