@@ -1,110 +1,126 @@
-#include <FS.h>          // File system for ESP8266
-#include <ESP8266WiFi.h>
-#include <PubSubClient.h>
-#include <ESP8266mDNS.h>
-#include <ArduinoOTA.h>
-#include <WiFiManager.h>  // https://github.com/tzapu/WiFiManager
-#include <ArduinoJson.h>  // https://github.com/bblanchon/ArduinoJson
+#include <Arduino.h>
+#include "config.h"
+#include "wifi_setup.h"
+#include "mqtt_handler.h"
+#include "ota_setup.h"
 
-// WiFiManager AP settings (when no WiFi is configured)
-const char* ap_ssid = "SprinklerSetup";     // AP name for configuration portal
-const char* ap_password = "sprinklerconfig"; // AP password, empty for open network
-
-// MQTT broker details
+// MQTT connection parameters
 char mqtt_server[40] = "";
 char mqtt_port[6] = "1883";
 char mqtt_user[24] = "";
 char mqtt_password[24] = "";
-const char* client_id = "sprinkler_controller";
 
-// MQTT topics
-const char* topic_prefix = "home/sprinkler/";
-const char* topic_zone_command = "home/sprinkler/zone/+/command";
-const char* topic_status = "home/sprinkler/status";
-
-// Zone configuration - adjust according to your setup
-const int NUM_ZONES = 7;
-// ESP8266 usable GPIO pins: D1(5), D2(4), D5(14), D6(12), D7(13), D8(15), D0(16)
-const int zonePins[NUM_ZONES] = {5, 4, 14, 12, 13, 15, 16}; 
-const char* zoneNames[NUM_ZONES] = {
-  "Front Lawn", 
-  "Back Lawn", 
-  "Garden", 
-  "Side Yard", 
-  "Flower Bed", 
-  "Drip System", 
-  "Extra Zone"
-};
-
+// Client objects
 WiFiClient espClient;
 PubSubClient mqtt(espClient);
 
+// Timing variables
 unsigned long lastReconnectAttempt = 0;
 unsigned long lastStatusReport = 0;
-const unsigned long STATUS_INTERVAL = 60000; // Status update every 60 seconds
 
 // Flag for WiFiManager reset
 bool shouldSaveConfig = false;
 
-// Callback notifying us of the need to save config
-void saveConfigCallback() {
-  Serial.println("Should save config");
-  shouldSaveConfig = true;
+// Callback for MQTT messages
+void callback(char* topic, byte* payload, unsigned int length) {
+  String message;
+  for (unsigned int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  
+  DEBUG_PRINT("Message arrived [");
+  DEBUG_PRINT(topic);
+  DEBUG_PRINT("] ");
+  DEBUG_PRINTLN(message);
+
+  // Extract zone number from topic
+  String topicStr = String(topic);
+  int zoneStartPos = topicStr.indexOf("/zone/") + 6;
+  int zoneEndPos = topicStr.indexOf("/command");
+  
+  if (zoneStartPos > 6 && zoneEndPos > zoneStartPos) {
+    String zoneStr = topicStr.substring(zoneStartPos, zoneEndPos);
+    int zone = zoneStr.toInt();
+    
+    if (zone > 0 && zone <= NUM_ZONES) {
+      int zoneIndex = zone - 1;
+      
+      if (message == "ON" || message == "on" || message == "1") {
+        digitalWrite(ZONE_PINS[zoneIndex], HIGH);
+        mqtt.publish((String(MQTT_TOPIC_PREFIX) + "zone/" + zone + "/state").c_str(), "ON", true);
+        DEBUG_PRINT("Turning ON zone ");
+        DEBUG_PRINTLN(zone);
+      } else if (message == "OFF" || message == "off" || message == "0") {
+        digitalWrite(ZONE_PINS[zoneIndex], LOW);
+        mqtt.publish((String(MQTT_TOPIC_PREFIX) + "zone/" + zone + "/state").c_str(), "OFF", true);
+        DEBUG_PRINT("Turning OFF zone ");
+        DEBUG_PRINTLN(zone);
+      }
+    }
+  }
 }
 
-// Function to load saved configuration
+// Load saved configuration from filesystem
 void loadConfig() {
-  Serial.println("Mounting file system...");
+  DEBUG_PRINTLN("Mounting file system...");
   
   if (SPIFFS.begin()) {
-    Serial.println("Mounted file system");
+    DEBUG_PRINTLN("Mounted file system");
     if (SPIFFS.exists("/config.json")) {
       // File exists, reading and loading
-      Serial.println("Reading config file");
+      DEBUG_PRINTLN("Reading config file");
       File configFile = SPIFFS.open("/config.json", "r");
       if (configFile) {
-        Serial.println("Opened config file");
+        DEBUG_PRINTLN("Opened config file");
         size_t size = configFile.size();
         // Allocate a buffer to store contents of the file.
         std::unique_ptr<char[]> buf(new char[size]);
 
         configFile.readBytes(buf.get(), size);
 
-        DynamicJsonDocument json(1024);
+        // Calculate buffer size with ArduinoJson Assistant
+        const size_t capacity = JSON_OBJECT_SIZE(4) + 100;
+        DynamicJsonDocument json(capacity);
         DeserializationError error = deserializeJson(json, buf.get());
         
         if (!error) {
-          Serial.println("Parsed json");
+          DEBUG_PRINTLN("Parsed json");
           strcpy(mqtt_server, json["mqtt_server"]);
           strcpy(mqtt_port, json["mqtt_port"]);
           strcpy(mqtt_user, json["mqtt_user"]);
           strcpy(mqtt_password, json["mqtt_password"]);
         } else {
-          Serial.println("Failed to load json config");
+          DEBUG_PRINTLN("Failed to load json config");
         }
         configFile.close();
       }
     }
   } else {
-    Serial.println("Failed to mount file system");
+    DEBUG_PRINTLN("Failed to mount file system");
   }
 }
 
-void setup_wifi() {
+// Callback notifying us of the need to save config
+void saveConfigCallback() {
+  DEBUG_PRINTLN("Should save config");
+  shouldSaveConfig = true;
+}
+
+// Setup WiFi connection using WiFiManager
+void setupWifi() {
   delay(10);
-  Serial.println();
+  DEBUG_PRINTLN();
   // Load saved configuration first
   loadConfig();
-  Serial.println("Setting up WiFi and MQTT params...");
+  DEBUG_PRINTLN("Setting up WiFi and MQTT params...");
 
-  // The extra parameters to be configured (can be either global or just in the setup)
+  // The extra parameters to be configured
   WiFiManagerParameter custom_mqtt_server("server", "MQTT Server", mqtt_server, 40);
   WiFiManagerParameter custom_mqtt_port("port", "MQTT Port", mqtt_port, 6);
   WiFiManagerParameter custom_mqtt_user("user", "MQTT User", mqtt_user, 24);
   WiFiManagerParameter custom_mqtt_password("password", "MQTT Password", mqtt_password, 24, "password");
 
   // WiFiManager
-  // Local initialization. Once its business is done, there is no need to keep it around
   WiFiManager wifiManager;
 
   // Set callback for saving configuration
@@ -117,16 +133,16 @@ void setup_wifi() {
   wifiManager.addParameter(&custom_mqtt_password);
   
   // Set timeout for the configuration portal
-  wifiManager.setConfigPortalTimeout(180); // 3 minutes timeout
+  wifiManager.setConfigPortalTimeout(CONFIG_PORTAL_TIMEOUT);
   
   // Reset saved settings - uncomment to test
   //wifiManager.resetSettings();
   
   // Set custom AP name and optional password
-  bool connected = wifiManager.autoConnect(ap_ssid, ap_password);
+  bool connected = wifiManager.autoConnect(AP_SSID, AP_PASSWORD);
   
   if (!connected) {
-    Serial.println("Failed to connect and hit timeout");
+    DEBUG_PRINTLN("Failed to connect and hit timeout");
     // Reset and try again
     ESP.restart();
     delay(5000);
@@ -138,14 +154,18 @@ void setup_wifi() {
   strcpy(mqtt_user, custom_mqtt_user.getValue());
   strcpy(mqtt_password, custom_mqtt_password.getValue());
   
-  Serial.println("WiFi connected");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
+  DEBUG_PRINTLN("WiFi connected");
+  DEBUG_PRINT("IP address: ");
+  DEBUG_PRINTLN(WiFi.localIP());
   
   // Save the custom parameters to file system
   if (shouldSaveConfig) {
-    Serial.println("Saving config to /config.json");
-    DynamicJsonDocument json(1024);
+    DEBUG_PRINTLN("Saving config to /config.json");
+    
+    // Calculate buffer size with ArduinoJson Assistant
+    const size_t capacity = JSON_OBJECT_SIZE(4) + 100;
+    DynamicJsonDocument json(capacity);
+    
     json["mqtt_server"] = mqtt_server;
     json["mqtt_port"] = mqtt_port;
     json["mqtt_user"] = mqtt_user;
@@ -153,15 +173,16 @@ void setup_wifi() {
 
     File configFile = SPIFFS.open("/config.json", "w");
     if (!configFile) {
-      Serial.println("Failed to open config file for writing");
+      DEBUG_PRINTLN("Failed to open config file for writing");
     } else {
       serializeJson(json, configFile);
       configFile.close();
-      Serial.println("Config saved successfully");
+      DEBUG_PRINTLN("Config saved successfully");
     }
   }
 }
 
+// Setup OTA updates
 void setupOTA() {
   // Port defaults to 8266
   ArduinoOTA.setPort(8266);
@@ -179,90 +200,53 @@ void setupOTA() {
     } else { // U_FS
       type = "filesystem";
     }
-    Serial.println("Start updating " + type);
+    DEBUG_PRINTLN("Start updating " + type);
   });
   
   ArduinoOTA.onEnd([]() {
-    Serial.println("\nEnd");
+    DEBUG_PRINTLN("\nEnd");
   });
   
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+    DEBUG_PRINTF("Progress: %u%%\r", (progress / (total / 100)));
   });
   
   ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("Error[%u]: ", error);
+    DEBUG_PRINTF("Error[%u]: ", error);
     if (error == OTA_AUTH_ERROR) {
-      Serial.println("Auth Failed");
+      DEBUG_PRINTLN("Auth Failed");
     } else if (error == OTA_BEGIN_ERROR) {
-      Serial.println("Begin Failed");
+      DEBUG_PRINTLN("Begin Failed");
     } else if (error == OTA_CONNECT_ERROR) {
-      Serial.println("Connect Failed");
+      DEBUG_PRINTLN("Connect Failed");
     } else if (error == OTA_RECEIVE_ERROR) {
-      Serial.println("Receive Failed");
+      DEBUG_PRINTLN("Receive Failed");
     } else if (error == OTA_END_ERROR) {
-      Serial.println("End Failed");
+      DEBUG_PRINTLN("End Failed");
     }
   });
   
   ArduinoOTA.begin();
 }
 
-void callback(char* topic, byte* payload, unsigned int length) {
-  String message;
-  for (unsigned int i = 0; i < length; i++) {
-    message += (char)payload[i];
-  }
-  
-  Serial.print("Message arrived [");
-  Serial.print(topic);
-  Serial.print("] ");
-  Serial.println(message);
-
-  // Extract zone number from topic
-  String topicStr = String(topic);
-  int zoneStartPos = topicStr.indexOf("/zone/") + 6;
-  int zoneEndPos = topicStr.indexOf("/command");
-  
-  if (zoneStartPos > 6 && zoneEndPos > zoneStartPos) {
-    String zoneStr = topicStr.substring(zoneStartPos, zoneEndPos);
-    int zone = zoneStr.toInt();
-    
-    if (zone > 0 && zone <= NUM_ZONES) {
-      int zoneIndex = zone - 1;
-      
-      if (message == "ON" || message == "on" || message == "1") {
-        digitalWrite(zonePins[zoneIndex], HIGH);
-        mqtt.publish((String(topic_prefix) + "zone/" + zone + "/state").c_str(), "ON", true);
-        Serial.print("Turning ON zone ");
-        Serial.println(zone);
-      } else if (message == "OFF" || message == "off" || message == "0") {
-        digitalWrite(zonePins[zoneIndex], LOW);
-        mqtt.publish((String(topic_prefix) + "zone/" + zone + "/state").c_str(), "OFF", true);
-        Serial.print("Turning OFF zone ");
-        Serial.println(zone);
-      }
-    }
-  }
-}
-
-boolean reconnect() {
+// Attempt to reconnect to MQTT
+boolean reconnectMqtt() {
   int mqtt_port_int = atoi(mqtt_port);
   mqtt.setServer(mqtt_server, mqtt_port_int);
   
-  if (mqtt.connect(client_id, mqtt_user, mqtt_password, topic_status, 0, true, "offline")) {
-    Serial.println("MQTT connected");
+  if (mqtt.connect(MQTT_CLIENT_ID, mqtt_user, mqtt_password, MQTT_STATUS, 0, true, "offline")) {
+    DEBUG_PRINTLN("MQTT connected");
     
     // Subscribe to zone commands
-    mqtt.subscribe(topic_zone_command);
+    mqtt.subscribe(MQTT_ZONE_COMMAND);
     
     // Publish that we're online
-    mqtt.publish(topic_status, "online", true);
+    mqtt.publish(MQTT_STATUS, "online", true);
     
     // Publish current state of all zones
     for (int i = 0; i < NUM_ZONES; i++) {
-      String stateTopic = String(topic_prefix) + "zone/" + String(i+1) + "/state";
-      mqtt.publish(stateTopic.c_str(), digitalRead(zonePins[i]) == HIGH ? "ON" : "OFF", true);
+      String stateTopic = String(MQTT_TOPIC_PREFIX) + "zone/" + String(i+1) + "/state";
+      mqtt.publish(stateTopic.c_str(), digitalRead(ZONE_PINS[i]) == HIGH ? "ON" : "OFF", true);
     }
     
     // Publish zone configurations for Home Assistant auto-discovery
@@ -271,73 +255,87 @@ boolean reconnect() {
   return mqtt.connected();
 }
 
+// Publish Home Assistant MQTT discovery configurations
 void publishHomeAssistantConfig() {
-  // Publish configuration for each zone to support Home Assistant MQTT discovery
+  // Calculate buffer size with ArduinoJson Assistant
+  const size_t capacity = JSON_OBJECT_SIZE(12) + 300;
+  
   for (int i = 0; i < NUM_ZONES; i++) {
     String zoneNum = String(i + 1);
     String configTopic = "homeassistant/switch/sprinkler_zone" + zoneNum + "/config";
     
-    // Create discovery payload
-    String payload = "{";
-    payload += "\"name\":\"" + String(zoneNames[i]) + "\",";
-    payload += "\"unique_id\":\"sprinkler_zone" + zoneNum + "\",";
-    payload += "\"command_topic\":\"" + String(topic_prefix) + "zone/" + zoneNum + "/command\",";
-    payload += "\"state_topic\":\"" + String(topic_prefix) + "zone/" + zoneNum + "/state\",";
-    payload += "\"availability_topic\":\"" + String(topic_status) + "\",";
-    payload += "\"payload_on\":\"ON\",";
-    payload += "\"payload_off\":\"OFF\",";
-    payload += "\"state_on\":\"ON\",";
-    payload += "\"state_off\":\"OFF\",";
-    payload += "\"optimistic\":false,";
-    payload += "\"qos\":0,";
-    payload += "\"retain\":true";
-    payload += "}";
+    // Create discovery payload using ArduinoJson
+    DynamicJsonDocument json(capacity);
     
+    json["name"] = ZONE_NAMES[i];
+    json["unique_id"] = "sprinkler_zone" + zoneNum;
+    json["command_topic"] = String(MQTT_TOPIC_PREFIX) + "zone/" + zoneNum + "/command";
+    json["state_topic"] = String(MQTT_TOPIC_PREFIX) + "zone/" + zoneNum + "/state";
+    json["availability_topic"] = MQTT_STATUS;
+    json["payload_on"] = "ON";
+    json["payload_off"] = "OFF";
+    json["state_on"] = "ON";
+    json["state_off"] = "OFF";
+    json["optimistic"] = false;
+    json["qos"] = 0;
+    json["retain"] = true;
+    
+    // Serialize json to string and publish
+    String payload;
+    serializeJson(json, payload);
     mqtt.publish(configTopic.c_str(), payload.c_str(), true);
   }
 }
 
+// Publish status information
 void publishStatus() {
-  String status = "{\"status\":\"online\",\"zones\":[";
+  // Calculate buffer size with ArduinoJson Assistant
+  const size_t capacity = JSON_OBJECT_SIZE(2) + JSON_ARRAY_SIZE(NUM_ZONES) + NUM_ZONES * JSON_OBJECT_SIZE(3) + 200;
+  DynamicJsonDocument json(capacity);
+  
+  json["status"] = "online";
+  
+  JsonArray zones = json.createNestedArray("zones");
   
   for (int i = 0; i < NUM_ZONES; i++) {
-    if (i > 0) status += ",";
-    status += "{\"zone\":" + String(i+1) + ",";
-    status += "\"name\":\"" + String(zoneNames[i]) + "\",";
-    status += "\"state\":\"" + String(digitalRead(zonePins[i]) == HIGH ? "ON" : "OFF") + "\"}";
+    JsonObject zone = zones.createNestedObject();
+    zone["zone"] = i + 1;
+    zone["name"] = ZONE_NAMES[i];
+    zone["state"] = digitalRead(ZONE_PINS[i]) == HIGH ? "ON" : "OFF";
   }
   
-  status += "]}";
-  mqtt.publish(topic_status, status.c_str(), true);
+  // Serialize json to string and publish
+  String status;
+  serializeJson(json, status);
+  mqtt.publish(MQTT_STATUS, status.c_str(), true);
 }
 
+// Main setup function
 void setup() {
   Serial.begin(115200);
-  Serial.println("\nStarting Sprinkler Controller");
+  DEBUG_PRINTLN("\nStarting Sprinkler Controller");
   
   // Initialize all zone pins as outputs and set to LOW (off)
   for (int i = 0; i < NUM_ZONES; i++) {
-    pinMode(zonePins[i], OUTPUT);
-    digitalWrite(zonePins[i], LOW);
-    Serial.print("Initialized zone ");
-    Serial.print(i+1);
-    Serial.print(" (");
-    Serial.print(zoneNames[i]);
-    Serial.println(") as OFF");
+    pinMode(ZONE_PINS[i], OUTPUT);
+    digitalWrite(ZONE_PINS[i], LOW);
+    DEBUG_PRINT("Initialized zone ");
+    DEBUG_PRINT(i+1);
+    DEBUG_PRINT(" (");
+    DEBUG_PRINT(ZONE_NAMES[i]);
+    DEBUG_PRINTLN(") as OFF");
   }
   
-  setup_wifi();
+  setupWifi();
   setupOTA();
   
-  // MQTT server is set in reconnect() function now
-  // Convert mqtt_port string to int
-  int mqtt_port_int = atoi(mqtt_port);
-  mqtt.setServer(mqtt_server, mqtt_port_int);
+  // Set up MQTT callback
   mqtt.setCallback(callback);
   
   lastReconnectAttempt = 0;
 }
 
+// Main loop function
 void loop() {
   // Handle OTA updates
   ArduinoOTA.handle();
@@ -345,10 +343,10 @@ void loop() {
   // Handle MQTT connection
   if (!mqtt.connected()) {
     unsigned long now = millis();
-    if (now - lastReconnectAttempt > 5000) {
+    if (now - lastReconnectAttempt > RECONNECT_INTERVAL) {
       lastReconnectAttempt = now;
       // Attempt to reconnect
-      if (reconnect()) {
+      if (reconnectMqtt()) {
         lastReconnectAttempt = 0;
       }
     }
