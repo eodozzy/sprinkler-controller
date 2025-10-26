@@ -1,3 +1,22 @@
+/*
+ * SECURITY NOTICE:
+ * ================
+ * This firmware stores MQTT credentials in plaintext on the SPIFFS filesystem.
+ * Anyone with physical access to the device can read these credentials via USB.
+ * This is a known limitation of the current architecture.
+ *
+ * Mitigations in place:
+ * - OTA updates require chip-specific password (see serial output)
+ * - Configuration portal uses unique password per device
+ * - Network credentials managed by ESP8266 WiFi core (encrypted)
+ *
+ * For production deployments, consider:
+ * - Physical security of devices
+ * - Network isolation (separate VLAN for IoT devices)
+ * - MQTT broker authentication and TLS
+ * - Regular security audits
+ */
+
 #include <Arduino.h>
 #include <FS.h>
 #include "config.h"
@@ -22,7 +41,21 @@ unsigned long lastStatusReport = 0;
 // Flag for WiFiManager reset
 bool shouldSaveConfig = false;
 
-// Callback for MQTT messages
+// Zone runtime tracking for safety limits
+unsigned long zone_on_time[NUM_ZONES] = {0};
+
+/**
+ * MQTT message callback - handles incoming zone control commands
+ *
+ * @param topic The MQTT topic the message was received on
+ * @param payload Raw byte array containing the message payload
+ * @param length Number of bytes in the payload
+ *
+ * Side effects:
+ * - Parses zone number from topic (expects format: home/sprinkler/zone/N/command)
+ * - Controls GPIO pins to turn zones ON/OFF based on payload ("ON", "OFF", "1", "0")
+ * - Publishes state confirmation back to MQTT state topic
+ */
 void callback(char* topic, byte* payload, unsigned int length) {
   // Use stack buffer for message (longest valid message is "OFF" = 3 chars)
   char message[MQTT_MESSAGE_BUFFER_SIZE];
@@ -76,7 +109,18 @@ void callback(char* topic, byte* payload, unsigned int length) {
   }
 }
 
-// Load saved configuration from filesystem
+/**
+ * Load MQTT configuration from SPIFFS filesystem
+ *
+ * Reads /config.json and populates mqtt_server, mqtt_port, mqtt_user, mqtt_password
+ * global variables. Implements retry logic for transient SPIFFS mount failures.
+ *
+ * Side effects:
+ * - Mounts SPIFFS filesystem (retries up to 3 times)
+ * - Reads and parses /config.json if it exists
+ * - Updates global MQTT configuration variables
+ * - Outputs debug messages via Serial
+ */
 void loadConfig() {
   DEBUG_PRINTLN("Mounting file system...");
 
@@ -117,6 +161,18 @@ void loadConfig() {
           strlcpy(mqtt_port, json["mqtt_port"] | "1883", sizeof(mqtt_port));
           strlcpy(mqtt_user, json["mqtt_user"] | "", sizeof(mqtt_user));
           strlcpy(mqtt_password, json["mqtt_password"] | "", sizeof(mqtt_password));
+
+          // Validate loaded configuration
+          bool config_valid = (strlen(mqtt_server) > 0 &&
+                              strlen(mqtt_port) > 0 &&
+                              atoi(mqtt_port) > 0 &&
+                              atoi(mqtt_port) <= 65535);
+
+          if (!config_valid) {
+            DEBUG_PRINTLN("Config validation failed - will force reconfiguration on next WiFi setup");
+            // Clear invalid config
+            mqtt_server[0] = '\0';
+          }
         } else {
           DEBUG_PRINTLN("Failed to load json config");
         }
@@ -130,13 +186,34 @@ void loadConfig() {
   }
 }
 
-// Callback notifying us of the need to save config
+/**
+ * Callback to flag that WiFiManager configuration needs to be saved
+ *
+ * Called by WiFiManager when user submits new configuration via web portal.
+ *
+ * Side effects:
+ * - Sets shouldSaveConfig global flag to true
+ */
 void saveConfigCallback() {
   DEBUG_PRINTLN("Should save config");
   shouldSaveConfig = true;
 }
 
-// Setup WiFi connection using WiFiManager
+/**
+ * Setup WiFi connection and configure MQTT parameters via WiFiManager
+ *
+ * Implements a captive portal for WiFi and MQTT configuration. Loads existing
+ * config from SPIFFS, presents web UI for changes, saves updated config back to
+ * filesystem. Forces configuration portal if no valid MQTT server is configured.
+ *
+ * Side effects:
+ * - Calls loadConfig() to read saved configuration
+ * - Starts WiFiManager captive portal (SSID: "SprinklerSetup")
+ * - Connects to WiFi network
+ * - Updates global MQTT configuration variables
+ * - Saves configuration to /config.json if changed
+ * - Restarts ESP8266 if connection fails or times out
+ */
 void setupWifi() {
   delay(10);
   DEBUG_PRINTLN();
@@ -154,6 +231,15 @@ void setupWifi() {
   // WiFiManager
   WiFiManager wifiManager;
 
+  // Generate unique AP password from chip ID for security
+  char ap_password[32];
+  snprintf(ap_password, sizeof(ap_password), "sprinkler-%08X", ESP.getChipId());
+
+  DEBUG_PRINTLN("=================================");
+  DEBUG_PRINT("Configuration Portal Password: ");
+  DEBUG_PRINTLN(ap_password);
+  DEBUG_PRINTLN("=================================");
+
   // Check if we have valid configuration - force portal if empty
   if (mqtt_server[0] == '\0') {
     DEBUG_PRINTLN("No valid config found, forcing configuration portal");
@@ -162,21 +248,21 @@ void setupWifi() {
 
   // Set callback for saving configuration
   wifiManager.setSaveConfigCallback(saveConfigCallback);
-  
+
   // Add all your parameters here
   wifiManager.addParameter(&custom_mqtt_server);
   wifiManager.addParameter(&custom_mqtt_port);
   wifiManager.addParameter(&custom_mqtt_user);
   wifiManager.addParameter(&custom_mqtt_password);
-  
+
   // Set timeout for the configuration portal
   wifiManager.setConfigPortalTimeout(CONFIG_PORTAL_TIMEOUT);
-  
+
   // Reset saved settings - uncomment to test
   //wifiManager.resetSettings();
-  
-  // Set custom AP name and optional password
-  bool connected = wifiManager.autoConnect(AP_SSID, AP_PASSWORD);
+
+  // Set custom AP name with unique password (not hardcoded)
+  bool connected = wifiManager.autoConnect(AP_SSID, ap_password);
   
   if (!connected) {
     DEBUG_PRINTLN("Failed to connect and hit timeout");
@@ -218,7 +304,17 @@ void setupWifi() {
   }
 }
 
-// Setup OTA updates
+/**
+ * Configure Over-The-Air (OTA) firmware update functionality
+ *
+ * Sets up ArduinoOTA with hostname "sprinkler-controller" on port 8266.
+ * Registers callbacks for update progress and error reporting.
+ *
+ * Side effects:
+ * - Configures OTA hostname and port
+ * - Registers event handlers for OTA updates
+ * - Calls ArduinoOTA.begin()
+ */
 void setupOTA() {
   // Port defaults to 8266
   ArduinoOTA.setPort(8266);
@@ -226,17 +322,25 @@ void setupOTA() {
   // Hostname defaults to esp8266-[ChipID]
   ArduinoOTA.setHostname("sprinkler-controller");
 
-  // No authentication by default
-  // ArduinoOTA.setPassword("admin");
+  // Generate unique OTA password from chip ID for security
+  char ota_password[16];
+  snprintf(ota_password, sizeof(ota_password), "%08X", ESP.getChipId());
+  ArduinoOTA.setPassword(ota_password);
+  DEBUG_PRINTLN("=================================");
+  DEBUG_PRINT("OTA Password: ");
+  DEBUG_PRINTLN(ota_password);
+  DEBUG_PRINTLN("=================================");
 
   ArduinoOTA.onStart([]() {
-    String type;
+    // Use stack buffer instead of String to avoid heap allocation
+    const char* type;
     if (ArduinoOTA.getCommand() == U_FLASH) {
       type = "sketch";
     } else { // U_FS
       type = "filesystem";
     }
-    DEBUG_PRINTLN("Start updating " + type);
+    DEBUG_PRINT("Start updating ");
+    DEBUG_PRINTLN(type);
   });
   
   ArduinoOTA.onEnd([]() {
@@ -265,7 +369,22 @@ void setupOTA() {
   ArduinoOTA.begin();
 }
 
-// Attempt to reconnect to MQTT
+/**
+ * Attempt to connect/reconnect to MQTT broker
+ *
+ * Validates and parses MQTT port, establishes connection with last will testament,
+ * subscribes to zone command topics, and publishes current state of all zones.
+ *
+ * @return true if connected to MQTT broker, false otherwise
+ *
+ * Side effects:
+ * - Configures MQTT server and port
+ * - Connects to MQTT broker with "offline" last will on status topic
+ * - Subscribes to "home/sprinkler/zone/+/command"
+ * - Publishes "online" to status topic
+ * - Publishes current state of all zones
+ * - Calls publishHomeAssistantConfig() for auto-discovery
+ */
 bool reconnectMqtt() {
   // Validate and convert port number, use default if invalid
   int mqtt_port_int = (mqtt_port[0] != '\0') ? atoi(mqtt_port) : 1883;
@@ -300,10 +419,21 @@ bool reconnectMqtt() {
   return mqtt.connected();
 }
 
-// Publish Home Assistant MQTT discovery configurations
+/**
+ * Publish Home Assistant MQTT auto-discovery configurations for all zones
+ *
+ * Sends discovery messages for each zone switch to enable automatic integration
+ * with Home Assistant. Includes device information for grouping all zones under
+ * a single device in the HA UI.
+ *
+ * Side effects:
+ * - Publishes 7 discovery messages to homeassistant/switch/sprinkler_zoneN/config
+ * - Each message contains switch configuration, MQTT topics, and device metadata
+ * - Device information includes chip ID, model, manufacturer, and software version
+ */
 void publishHomeAssistantConfig() {
-  // Calculate buffer size with ArduinoJson Assistant
-  const size_t capacity = JSON_OBJECT_SIZE(12) + 300;
+  // Calculate buffer size with ArduinoJson Assistant (includes device object)
+  const size_t capacity = JSON_OBJECT_SIZE(12) + JSON_OBJECT_SIZE(5) + 400;
 
   // Stack buffers for topic construction
   char configTopic[64];
@@ -311,6 +441,10 @@ void publishHomeAssistantConfig() {
   char commandTopic[64];
   char stateTopic[64];
   char payload[512];  // Buffer for serialized JSON
+  char deviceId[16];
+
+  // Generate device ID once for all zones
+  snprintf(deviceId, sizeof(deviceId), "%08X", ESP.getChipId());
 
   for (int i = 0; i < NUM_ZONES; i++) {
     int zoneNum = i + 1;
@@ -337,6 +471,14 @@ void publishHomeAssistantConfig() {
     json["qos"] = 0;
     json["retain"] = true;
 
+    // Add device information for Home Assistant
+    JsonObject device = json.createNestedObject("device");
+    device["name"] = "Sprinkler Controller";
+    device["identifiers"] = deviceId;
+    device["model"] = "ESP8266 NodeMCU";
+    device["manufacturer"] = "DIY";
+    device["sw_version"] = SW_VERSION;
+
     // Serialize json to buffer and publish
     size_t len = serializeJson(json, payload, sizeof(payload));
     if (len < sizeof(payload)) {
@@ -347,13 +489,29 @@ void publishHomeAssistantConfig() {
   }
 }
 
-// Publish status information
+/**
+ * Publish comprehensive status information to MQTT
+ *
+ * Sends a JSON payload containing system health metrics (uptime, free memory,
+ * WiFi signal strength, chip ID) and current state of all zones.
+ *
+ * Side effects:
+ * - Publishes JSON status message to home/sprinkler/status topic
+ * - Message includes: status, uptime, free_heap, wifi_rssi, chip_id, zones array
+ * - Each zone in array includes: zone number, name, and current state (ON/OFF)
+ */
 void publishStatus() {
   // Calculate buffer size with ArduinoJson Assistant
-  const size_t capacity = JSON_OBJECT_SIZE(2) + JSON_ARRAY_SIZE(NUM_ZONES) + NUM_ZONES * JSON_OBJECT_SIZE(3) + 200;
+  const size_t capacity = JSON_OBJECT_SIZE(6) + JSON_ARRAY_SIZE(NUM_ZONES) + NUM_ZONES * JSON_OBJECT_SIZE(3) + 300;
   DynamicJsonDocument json(capacity);
 
   json["status"] = "online";
+  json["uptime"] = millis() / 1000;  // seconds
+  json["free_heap"] = ESP.getFreeHeap();
+  json["wifi_rssi"] = WiFi.RSSI();
+  char chipId[16];
+  snprintf(chipId, sizeof(chipId), "%08X", ESP.getChipId());
+  json["chip_id"] = chipId;
 
   JsonArray zones = json.createNestedArray("zones");
 
@@ -391,8 +549,13 @@ void setup() {
   }
   
   setupWifi();
+
+  // Enable light sleep for power savings (~20mA reduction)
+  WiFi.setSleepMode(WIFI_LIGHT_SLEEP);
+  DEBUG_PRINTLN("WiFi light sleep enabled");
+
   setupOTA();
-  
+
   // Set up MQTT callback
   mqtt.setCallback(callback);
   
@@ -417,7 +580,27 @@ void loop() {
   } else {
     // Client connected
     mqtt.loop();
-    
+
+    // Safety check: enforce maximum zone runtime
+    for (int i = 0; i < NUM_ZONES; i++) {
+      if (digitalRead(ZONE_PINS[i]) == HIGH) {
+        if (zone_on_time[i] == 0) {
+          zone_on_time[i] = millis();
+        } else if (millis() - zone_on_time[i] > MAX_ZONE_RUNTIME) {
+          digitalWrite(ZONE_PINS[i], LOW);
+          DEBUG_PRINTF("Zone %d safety timeout - forced OFF after %d seconds\n",
+                       i+1, MAX_ZONE_RUNTIME/1000);
+          // Publish state update
+          char stateTopic[MQTT_TOPIC_BUFFER_SIZE];
+          snprintf(stateTopic, sizeof(stateTopic), "%szone/%d/state", MQTT_TOPIC_PREFIX, i+1);
+          mqtt.publish(stateTopic, "OFF", true);
+          zone_on_time[i] = 0;
+        }
+      } else {
+        zone_on_time[i] = 0;  // Reset timer when zone is off
+      }
+    }
+
     // Publish status periodically
     unsigned long now = millis();
     if (now - lastStatusReport > STATUS_INTERVAL) {

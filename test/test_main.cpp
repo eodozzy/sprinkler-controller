@@ -37,8 +37,19 @@ void loop() {
 // Test implementations
 
 void test_zone_pins_defined() {
+  // Valid ESP8266 GPIO pins: 0, 1, 2, 3, 4, 5, 12, 13, 14, 15, 16
+  const int validPins[] = {0, 1, 2, 3, 4, 5, 12, 13, 14, 15, 16};
+  const int numValidPins = sizeof(validPins) / sizeof(validPins[0]);
+
   for (int i = 0; i < NUM_ZONES; i++) {
-    TEST_ASSERT_NOT_EQUAL(0, ZONE_PINS[i]);
+    bool isValid = false;
+    for (int j = 0; j < numValidPins; j++) {
+      if (ZONE_PINS[i] == validPins[j]) {
+        isValid = true;
+        break;
+      }
+    }
+    TEST_ASSERT_TRUE_MESSAGE(isValid, "Zone pin must be a valid ESP8266 GPIO");
   }
 }
 
@@ -47,18 +58,29 @@ void test_zone_count() {
 }
 
 void test_mqtt_topic_parsing() {
-  // Test parsing of MQTT topics
-  String testTopic = "home/sprinkler/zone/3/command";
-  int zoneStartPos = testTopic.indexOf("/zone/") + 6;
-  int zoneEndPos = testTopic.indexOf("/command");
-  
-  TEST_ASSERT_GREATER_THAN(6, zoneStartPos);
-  TEST_ASSERT_GREATER_THAN(zoneStartPos, zoneEndPos);
-  
-  String zoneStr = testTopic.substring(zoneStartPos, zoneEndPos);
-  int zone = zoneStr.toInt();
-  
+  // Test parsing of MQTT topics using C-string functions (matches actual implementation)
+  const char* testTopic = "home/sprinkler/zone/3/command";
+
+  // Test the actual implementation logic from callback()
+  const char* zonePrefix = "/zone/";
+  const char* zonePrefixPos = strstr(testTopic, zonePrefix);
+  const char* commandSuffix = strstr(testTopic, "/command");
+
+  TEST_ASSERT_NOT_NULL_MESSAGE(zonePrefixPos, "Should find zone prefix");
+  TEST_ASSERT_NOT_NULL_MESSAGE(commandSuffix, "Should find command suffix");
+  TEST_ASSERT_TRUE_MESSAGE(commandSuffix > zonePrefixPos, "Command should come after zone");
+
+  const char* zoneNumStart = zonePrefixPos + strlen(zonePrefix);
+  int zone = atoi(zoneNumStart);  // Stops at first non-digit (the '/')
+
   TEST_ASSERT_EQUAL(3, zone);
+
+  // Test another zone number
+  const char* testTopic2 = "home/sprinkler/zone/7/command";
+  zonePrefixPos = strstr(testTopic2, zonePrefix);
+  zoneNumStart = zonePrefixPos + strlen(zonePrefix);
+  zone = atoi(zoneNumStart);
+  TEST_ASSERT_EQUAL(7, zone);
 }
 
 // Simulate incoming MQTT message

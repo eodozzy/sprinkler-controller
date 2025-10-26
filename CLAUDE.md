@@ -77,7 +77,7 @@ The project follows a modular structure with clear separation of concerns:
 **Configuration Management**:
 - WiFi/MQTT credentials stored in SPIFFS filesystem (`/config.json`)
 - Uses ArduinoJson for serialization/deserialization
-- WiFiManager provides captive portal for user configuration (AP: "SprinklerSetup", password: "sprinklerconfig")
+- WiFiManager provides captive portal for user configuration (AP: "SprinklerSetup", password generated from chip ID: "sprinkler-XXXXXXXX")
 - Config persists across reboots
 
 **MQTT Integration**:
@@ -118,6 +118,37 @@ The project follows a modular structure with clear separation of concerns:
 - Controlled by `DEBUG` flag in `config.h`
 - Uses conditional macros (`DEBUG_PRINT`, `DEBUG_PRINTLN`, `DEBUG_PRINTF`)
 - All debug output goes to Serial at 115200 baud
+
+## Security Considerations
+
+When working with this codebase, be aware of the following security characteristics:
+
+**Authentication:**
+- OTA updates use device-specific password (ESP.getChipId())
+- WiFi configuration portal uses unique password per device
+- MQTT authentication via username/password
+
+**Credential Storage:**
+- Credentials stored in plaintext in `/config.json` on SPIFFS
+- No encryption available due to ESP8266 memory constraints
+- Physical access = credential extraction risk
+
+**Input Validation:**
+- All MQTT payloads bounded and validated
+- Zone numbers checked against NUM_ZONES constant
+- Buffer overflow protection via strlcpy/snprintf
+
+**Safety Features:**
+- Zone runtime limited to MAX_ZONE_RUNTIME (2 hours)
+- Configuration validation prevents invalid states
+- SPIFFS mount retry logic for resilience
+
+When modifying security-sensitive code, maintain these principles:
+1. Never store additional credentials in plaintext
+2. Always bounds-check buffer operations
+3. Validate all user/network input
+4. Use device-specific values for passwords (ESP.getChipId())
+5. Log security events at DEBUG level
 
 ## Hardware Configuration
 

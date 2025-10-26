@@ -1,12 +1,17 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
+// Software version
+#define SW_VERSION "2.0.0"
+
 // Debug configuration
 #define DEBUG true  // Set to false to disable debug output
 
 // WiFiManager AP settings
 #define AP_SSID "SprinklerSetup"
-#define AP_PASSWORD "sprinklerconfig"
+// AP_PASSWORD is now generated dynamically from chip ID for security
+// See setupWifi() in main.cpp for password generation
+// #define AP_PASSWORD "sprinklerconfig"  // DEPRECATED: No longer used
 
 // MQTT settings
 #define MQTT_CLIENT_ID "sprinkler_controller"
@@ -21,6 +26,9 @@
 #define RECONNECT_INTERVAL 5000
 #define STATUS_INTERVAL 60000
 #define CONFIG_PORTAL_TIMEOUT 180  // Seconds
+
+// Safety: Maximum zone runtime (2 hours in milliseconds)
+#define MAX_ZONE_RUNTIME 7200000
 
 // MQTT buffer sizes for stack allocation
 #define MQTT_TOPIC_BUFFER_SIZE 64

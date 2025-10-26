@@ -13,6 +13,25 @@ A simple yet expandable sprinkler control system built on ESP8266 that communica
 - Status reporting to track zone states
 - Designed for easy expansion with future features
 
+## Security Notice
+
+This controller stores WiFi and MQTT credentials in **plaintext** on the device's flash memory. Anyone with physical access to the device can extract these credentials.
+
+**Security Recommendations:**
+- Use dedicated IoT credentials with limited privileges
+- Deploy on an isolated IoT VLAN when possible
+- Each device generates a unique configuration portal password based on its chip ID
+- OTA updates are password-protected (password displayed on serial console during boot)
+- Do not expose the MQTT broker to the internet without TLS
+
+**Security Features:**
+- Unique OTA password per device (based on ESP8266 chip ID)
+- Unique WiFi configuration portal password per device
+- Configuration validation prevents corrupt settings
+- Zone runtime safety limits (2-hour maximum)
+- No MQTT TLS/SSL (due to memory constraints)
+- No credential encryption on device (ESP8266 limitation)
+
 ## Hardware Requirements
 
 - ESP8266 board (NodeMCU, Wemos D1 Mini, etc.)
@@ -62,12 +81,9 @@ This project supports both Arduino IDE and PlatformIO development environments.
 
 2. Open the `sprinkler_controller.ino` file in Arduino IDE
 
-3. Edit the configuration settings:
-   - WiFi credentials
-   - MQTT broker details
-   - Zone names (if needed)
+3. Upload the sketch to your ESP8266 board
 
-4. Upload the sketch to your ESP8266 board
+4. Follow the First-Time Setup section below for WiFi and MQTT configuration
 
 ### PlatformIO
 
@@ -86,12 +102,7 @@ This project can be built using either the PlatformIO CLI or VSCode with Platfor
    git clone https://github.com/yourusername/sprinkler-controller.git
    ```
 
-2. Edit the configuration settings in `src/main.cpp`:
-   - WiFi credentials
-   - MQTT broker details
-   - Zone names (if needed)
-
-3. Build and upload the project:
+2. Build and upload the project:
    
    **CLI method**:
    ```
@@ -128,19 +139,34 @@ After the initial upload via USB, you can enable OTA updates:
 
 This project uses WiFiManager for easy network configuration without hardcoding credentials.
 
-1. When first powered on, the controller will create a WiFi access point named "SprinklerSetup"
+1. **Flash the firmware** using PlatformIO:
+   ```bash
+   pio run -t upload
+   ```
 
-2. Connect to this WiFi network using password "sprinklerconfig"
+2. **Connect to serial console** to get unique passwords:
+   ```bash
+   pio device monitor
+   ```
+   Note the displayed OTA password and Configuration Portal password.
 
-3. A captive portal should automatically open (or navigate to 192.168.4.1)
+3. **Connect to WiFi setup portal:**
+   - The device will create a WiFi access point named "SprinklerSetup"
+   - Password is displayed on serial console (format: sprinkler-XXXXXXXX)
+   - Connect to this network with your phone/computer
+   - Configuration portal will open automatically
+   - Enter your WiFi credentials and MQTT broker details
 
-4. Configure the following settings:
-   - Your home WiFi network credentials
-   - MQTT broker details (server, port, username, password)
+4. **Device will restart** and connect to your WiFi network
 
-5. After saving, the device will connect to your WiFi network and MQTT broker
+5. **For OTA updates** after initial setup:
+   ```bash
+   # Update platformio.ini with device IP
+   upload_protocol = espota
+   upload_port = <device-ip>
 
-6. The configuration is saved to flash memory and will be used on subsequent boots
+   # Use the OTA password from step 2
+   ```
 
 ### Reset Configuration
 
@@ -170,26 +196,61 @@ automation:
         entity_id: switch.front_lawn
 ```
 
+## Troubleshooting
+
+### Device stuck in AP mode
+- Check that WiFi credentials are correct
+- Verify MQTT broker is reachable from your network
+- Check serial console for error messages
+- If config is corrupted, device will automatically force reconfiguration
+
+### Zones not responding to commands
+- Verify MQTT broker is running
+- Check that device is subscribed to `home/sprinkler/zone/+/command`
+- Use MQTT client to verify messages are published
+- Check serial console DEBUG output for received commands
+
+### OTA upload fails
+- Verify device IP address in platformio.ini
+- Check OTA password matches (shown on serial during boot)
+- Ensure device is powered on and connected to WiFi
+- Try serial upload if OTA fails
+
+### Zone runs longer than expected
+- Safety limit is 2 hours - zone will auto-shutoff
+- Check MQTT state is being published correctly
+- Verify Home Assistant or controller is sending OFF command
+
+### Configuration portal password doesn't work
+- Password is based on chip ID and shown on serial console
+- Power cycle device and check serial output
+- Password format: sprinkler-XXXXXXXX (where X is chip ID in hex)
+
 ## Development Roadmap
 
-### Version 1.0 (Current)
+### Version 2.0 (Current - 2025-10-26)
 - ✅ Basic MQTT control of 7 zones
 - ✅ Home Assistant integration
-- ✅ OTA updates
+- ✅ OTA updates with device-specific passwords
+- ✅ WiFi configuration portal with unique passwords
+- ✅ Configuration validation and safety limits
+- ✅ Buffer overflow protection
+- ✅ Zone runtime safety limits (2-hour maximum)
 
-### Version 1.1 (Planned)
+### Version 2.1 (Planned)
 - [ ] Basic scheduling functionality
 - [ ] Web configuration interface
 - [ ] Manual control buttons
 - [ ] Status LEDs
 
-### Version 2.0 (Future)
+### Version 3.0 (Future)
 - [ ] Rain sensor integration
 - [ ] Soil moisture sensor support
 - [ ] Weather forecast integration
 - [ ] Water usage tracking
 - [ ] Autonomous operation if MQTT disconnects
 - [ ] Mobile app
+- [ ] MQTT TLS/SSL support
 
 ## Git Version Control
 
