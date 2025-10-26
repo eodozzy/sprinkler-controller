@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <FS.h>
 #include "config.h"
 #include "wifi_setup.h"
 #include "mqtt_handler.h"
@@ -23,36 +24,51 @@ bool shouldSaveConfig = false;
 
 // Callback for MQTT messages
 void callback(char* topic, byte* payload, unsigned int length) {
-  String message;
-  for (unsigned int i = 0; i < length; i++) {
-    message += (char)payload[i];
+  // Use stack buffer for message (longest valid message is "OFF" = 3 chars)
+  char message[MQTT_MESSAGE_BUFFER_SIZE];
+  if (length >= sizeof(message)) {
+    DEBUG_PRINTLN("Warning: Message too long, truncating");
+    length = sizeof(message) - 1;
   }
-  
+  memcpy(message, payload, length);
+  message[length] = '\0';
+
   DEBUG_PRINT("Message arrived [");
   DEBUG_PRINT(topic);
   DEBUG_PRINT("] ");
   DEBUG_PRINTLN(message);
 
-  // Extract zone number from topic
-  String topicStr = String(topic);
-  int zoneStartPos = topicStr.indexOf("/zone/") + 6;
-  int zoneEndPos = topicStr.indexOf("/command");
-  
-  if (zoneStartPos > 6 && zoneEndPos > zoneStartPos) {
-    String zoneStr = topicStr.substring(zoneStartPos, zoneEndPos);
-    int zone = zoneStr.toInt();
-    
+  // Extract zone number using C string functions (no String objects)
+  const char* zonePrefix = "/zone/";
+  const char* zonePrefixPos = strstr(topic, zonePrefix);
+  const char* commandSuffix = strstr(topic, "/command");
+
+  if (zonePrefixPos && commandSuffix && commandSuffix > zonePrefixPos) {
+    const char* zoneNumStart = zonePrefixPos + strlen(zonePrefix);
+    int zone = atoi(zoneNumStart);  // Stops at first non-digit (the '/')
+
     if (zone > 0 && zone <= NUM_ZONES) {
       int zoneIndex = zone - 1;
-      
-      if (message == "ON" || message == "on" || message == "1") {
+
+      // Build state topic using stack buffer
+      char stateTopic[MQTT_TOPIC_BUFFER_SIZE];
+      snprintf(stateTopic, sizeof(stateTopic), "%szone/%d/state", MQTT_TOPIC_PREFIX, zone);
+
+      // Case-insensitive comparison without String
+      char upperMessage[MQTT_MESSAGE_BUFFER_SIZE];
+      for (unsigned int i = 0; message[i] && i < sizeof(upperMessage) - 1; i++) {
+        upperMessage[i] = toupper(message[i]);
+      }
+      upperMessage[length] = '\0';
+
+      if (strcmp(upperMessage, "ON") == 0 || strcmp(message, "1") == 0) {
         digitalWrite(ZONE_PINS[zoneIndex], HIGH);
-        mqtt.publish((String(MQTT_TOPIC_PREFIX) + "zone/" + zone + "/state").c_str(), "ON", true);
+        mqtt.publish(stateTopic, "ON", true);
         DEBUG_PRINT("Turning ON zone ");
         DEBUG_PRINTLN(zone);
-      } else if (message == "OFF" || message == "off" || message == "0") {
+      } else if (strcmp(upperMessage, "OFF") == 0 || strcmp(message, "0") == 0) {
         digitalWrite(ZONE_PINS[zoneIndex], LOW);
-        mqtt.publish((String(MQTT_TOPIC_PREFIX) + "zone/" + zone + "/state").c_str(), "OFF", true);
+        mqtt.publish(stateTopic, "OFF", true);
         DEBUG_PRINT("Turning OFF zone ");
         DEBUG_PRINTLN(zone);
       }
@@ -63,8 +79,20 @@ void callback(char* topic, byte* payload, unsigned int length) {
 // Load saved configuration from filesystem
 void loadConfig() {
   DEBUG_PRINTLN("Mounting file system...");
-  
-  if (SPIFFS.begin()) {
+
+  // Try mounting SPIFFS with retry for transient errors
+  bool mounted = false;
+  int retries = 3;
+  while (!mounted && retries > 0) {
+    mounted = SPIFFS.begin();
+    if (!mounted) {
+      DEBUG_PRINTF("SPIFFS mount failed, retrying... (%d attempts left)\n", retries);
+      delay(500);
+      retries--;
+    }
+  }
+
+  if (mounted) {
     DEBUG_PRINTLN("Mounted file system");
     if (SPIFFS.exists("/config.json")) {
       // File exists, reading and loading
@@ -85,18 +113,20 @@ void loadConfig() {
         
         if (!error) {
           DEBUG_PRINTLN("Parsed json");
-          strcpy(mqtt_server, json["mqtt_server"]);
-          strcpy(mqtt_port, json["mqtt_port"]);
-          strcpy(mqtt_user, json["mqtt_user"]);
-          strcpy(mqtt_password, json["mqtt_password"]);
+          strlcpy(mqtt_server, json["mqtt_server"] | "", sizeof(mqtt_server));
+          strlcpy(mqtt_port, json["mqtt_port"] | "1883", sizeof(mqtt_port));
+          strlcpy(mqtt_user, json["mqtt_user"] | "", sizeof(mqtt_user));
+          strlcpy(mqtt_password, json["mqtt_password"] | "", sizeof(mqtt_password));
         } else {
           DEBUG_PRINTLN("Failed to load json config");
         }
         configFile.close();
       }
+    } else {
+      DEBUG_PRINTLN("Config file not found - first boot or reset");
     }
   } else {
-    DEBUG_PRINTLN("Failed to mount file system");
+    DEBUG_PRINTLN("Failed to mount file system after retries - filesystem may be corrupted");
   }
 }
 
@@ -112,6 +142,7 @@ void setupWifi() {
   DEBUG_PRINTLN();
   // Load saved configuration first
   loadConfig();
+
   DEBUG_PRINTLN("Setting up WiFi and MQTT params...");
 
   // The extra parameters to be configured
@@ -122,6 +153,12 @@ void setupWifi() {
 
   // WiFiManager
   WiFiManager wifiManager;
+
+  // Check if we have valid configuration - force portal if empty
+  if (mqtt_server[0] == '\0') {
+    DEBUG_PRINTLN("No valid config found, forcing configuration portal");
+    wifiManager.resetSettings();
+  }
 
   // Set callback for saving configuration
   wifiManager.setSaveConfigCallback(saveConfigCallback);
@@ -145,14 +182,13 @@ void setupWifi() {
     DEBUG_PRINTLN("Failed to connect and hit timeout");
     // Reset and try again
     ESP.restart();
-    delay(5000);
   }
   
   // Read updated parameters
-  strcpy(mqtt_server, custom_mqtt_server.getValue());
-  strcpy(mqtt_port, custom_mqtt_port.getValue());
-  strcpy(mqtt_user, custom_mqtt_user.getValue());
-  strcpy(mqtt_password, custom_mqtt_password.getValue());
+  strlcpy(mqtt_server, custom_mqtt_server.getValue(), sizeof(mqtt_server));
+  strlcpy(mqtt_port, custom_mqtt_port.getValue(), sizeof(mqtt_port));
+  strlcpy(mqtt_user, custom_mqtt_user.getValue(), sizeof(mqtt_user));
+  strlcpy(mqtt_password, custom_mqtt_password.getValue(), sizeof(mqtt_password));
   
   DEBUG_PRINTLN("WiFi connected");
   DEBUG_PRINT("IP address: ");
@@ -230,8 +266,16 @@ void setupOTA() {
 }
 
 // Attempt to reconnect to MQTT
-boolean reconnectMqtt() {
-  int mqtt_port_int = atoi(mqtt_port);
+bool reconnectMqtt() {
+  // Validate and convert port number, use default if invalid
+  int mqtt_port_int = (mqtt_port[0] != '\0') ? atoi(mqtt_port) : 1883;
+  if (mqtt_port_int <= 0 || mqtt_port_int > 65535) {
+    mqtt_port_int = 1883;  // Fallback to default MQTT port
+    DEBUG_PRINTLN("Invalid MQTT port, using default 1883");
+  }
+
+  // Configure MQTT buffer size for large payloads (Home Assistant discovery)
+  mqtt.setBufferSize(512);
   mqtt.setServer(mqtt_server, mqtt_port_int);
   
   if (mqtt.connect(MQTT_CLIENT_ID, mqtt_user, mqtt_password, MQTT_STATUS, 0, true, "offline")) {
@@ -244,9 +288,10 @@ boolean reconnectMqtt() {
     mqtt.publish(MQTT_STATUS, "online", true);
     
     // Publish current state of all zones
+    char stateTopic[64];
     for (int i = 0; i < NUM_ZONES; i++) {
-      String stateTopic = String(MQTT_TOPIC_PREFIX) + "zone/" + String(i+1) + "/state";
-      mqtt.publish(stateTopic.c_str(), digitalRead(ZONE_PINS[i]) == HIGH ? "ON" : "OFF", true);
+      snprintf(stateTopic, sizeof(stateTopic), "%szone/%d/state", MQTT_TOPIC_PREFIX, i+1);
+      mqtt.publish(stateTopic, digitalRead(ZONE_PINS[i]) == HIGH ? "ON" : "OFF", true);
     }
     
     // Publish zone configurations for Home Assistant auto-discovery
@@ -259,18 +304,30 @@ boolean reconnectMqtt() {
 void publishHomeAssistantConfig() {
   // Calculate buffer size with ArduinoJson Assistant
   const size_t capacity = JSON_OBJECT_SIZE(12) + 300;
-  
+
+  // Stack buffers for topic construction
+  char configTopic[64];
+  char uniqueId[32];
+  char commandTopic[64];
+  char stateTopic[64];
+  char payload[512];  // Buffer for serialized JSON
+
   for (int i = 0; i < NUM_ZONES; i++) {
-    String zoneNum = String(i + 1);
-    String configTopic = "homeassistant/switch/sprinkler_zone" + zoneNum + "/config";
-    
+    int zoneNum = i + 1;
+
+    // Build all topic strings using stack buffers
+    snprintf(configTopic, sizeof(configTopic), "homeassistant/switch/sprinkler_zone%d/config", zoneNum);
+    snprintf(uniqueId, sizeof(uniqueId), "sprinkler_zone%d", zoneNum);
+    snprintf(commandTopic, sizeof(commandTopic), "%szone/%d/command", MQTT_TOPIC_PREFIX, zoneNum);
+    snprintf(stateTopic, sizeof(stateTopic), "%szone/%d/state", MQTT_TOPIC_PREFIX, zoneNum);
+
     // Create discovery payload using ArduinoJson
     DynamicJsonDocument json(capacity);
-    
+
     json["name"] = ZONE_NAMES[i];
-    json["unique_id"] = "sprinkler_zone" + zoneNum;
-    json["command_topic"] = String(MQTT_TOPIC_PREFIX) + "zone/" + zoneNum + "/command";
-    json["state_topic"] = String(MQTT_TOPIC_PREFIX) + "zone/" + zoneNum + "/state";
+    json["unique_id"] = uniqueId;
+    json["command_topic"] = commandTopic;
+    json["state_topic"] = stateTopic;
     json["availability_topic"] = MQTT_STATUS;
     json["payload_on"] = "ON";
     json["payload_off"] = "OFF";
@@ -279,11 +336,14 @@ void publishHomeAssistantConfig() {
     json["optimistic"] = false;
     json["qos"] = 0;
     json["retain"] = true;
-    
-    // Serialize json to string and publish
-    String payload;
-    serializeJson(json, payload);
-    mqtt.publish(configTopic.c_str(), payload.c_str(), true);
+
+    // Serialize json to buffer and publish
+    size_t len = serializeJson(json, payload, sizeof(payload));
+    if (len < sizeof(payload)) {
+      mqtt.publish(configTopic, payload, true);
+    } else {
+      DEBUG_PRINTLN("Warning: Home Assistant config payload truncated");
+    }
   }
 }
 
@@ -292,22 +352,26 @@ void publishStatus() {
   // Calculate buffer size with ArduinoJson Assistant
   const size_t capacity = JSON_OBJECT_SIZE(2) + JSON_ARRAY_SIZE(NUM_ZONES) + NUM_ZONES * JSON_OBJECT_SIZE(3) + 200;
   DynamicJsonDocument json(capacity);
-  
+
   json["status"] = "online";
-  
+
   JsonArray zones = json.createNestedArray("zones");
-  
+
   for (int i = 0; i < NUM_ZONES; i++) {
     JsonObject zone = zones.createNestedObject();
     zone["zone"] = i + 1;
     zone["name"] = ZONE_NAMES[i];
     zone["state"] = digitalRead(ZONE_PINS[i]) == HIGH ? "ON" : "OFF";
   }
-  
-  // Serialize json to string and publish
-  String status;
-  serializeJson(json, status);
-  mqtt.publish(MQTT_STATUS, status.c_str(), true);
+
+  // Serialize json to buffer and publish
+  char statusBuffer[512];
+  size_t len = serializeJson(json, statusBuffer, sizeof(statusBuffer));
+  if (len < sizeof(statusBuffer)) {
+    mqtt.publish(MQTT_STATUS, statusBuffer, true);
+  } else {
+    DEBUG_PRINTLN("Warning: Status payload truncated");
+  }
 }
 
 // Main setup function

@@ -22,6 +22,12 @@
 #define STATUS_INTERVAL 60000
 #define CONFIG_PORTAL_TIMEOUT 180  // Seconds
 
+// MQTT buffer sizes for stack allocation
+#define MQTT_TOPIC_BUFFER_SIZE 64
+#define MQTT_UNIQUE_ID_BUFFER_SIZE 32
+#define MQTT_PAYLOAD_BUFFER_SIZE 512
+#define MQTT_MESSAGE_BUFFER_SIZE 8
+
 // Hardware configuration
 #define NUM_ZONES 7
 

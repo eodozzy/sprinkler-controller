@@ -14,7 +14,7 @@ extern char mqtt_password[24];
 
 // Forward declarations
 void callback(char* topic, byte* payload, unsigned int length);
-boolean reconnectMqtt();
+bool reconnectMqtt();
 void publishHomeAssistantConfig();
 void publishStatus();
 
